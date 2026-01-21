@@ -1,0 +1,114 @@
+# -------------------------------------------
+# Step 0: Install packages in the correct order
+# Fix Sentinel issue for Python 3.12
+# -------------------------------------------
+%pip install --upgrade typing_extensions>=4.7.1
+
+import typing_extensions
+%pip show typing_extensions
+
+dbutils.library.restartPython()
+
+from databricks_langchain import DatabricksEmbeddings
+
+# Initialize embeddings
+embeddings = DatabricksEmbeddings(endpoint="databricks-bge-large-en")
+print("Databricks embeddings imported successfully!")
+
+
+
+
+# -------------------------------------------
+# Step 1: Load sample NYC Taxi dataset
+# -------------------------------------------
+df = spark.table("samples.nyctaxi.trips")
+df.show(5)
+
+# -------------------------------------------
+# Step 2: Add unique ID and content column
+# -------------------------------------------
+from pyspark.sql.functions import col, concat_ws, lit
+from pyspark.sql.window import Window
+from pyspark.sql.functions import row_number
+
+# Create unique ID
+window = Window.orderBy(lit(1))
+df = df.withColumn("id", row_number().over(window).cast("string"))
+
+# Create content column for embeddings
+df_text = df.select(
+    col("id"),
+    concat_ws(
+        " ",
+        lit("Taxi trip distance"),
+        col("trip_distance"),
+        lit("miles fare"),
+        col("fare_amount"),
+        lit("dollars"),
+        lit("pickup at"),
+        col("tpep_pickup_datetime")
+    ).alias("content")
+)
+
+df_text.show(5, truncate=False)
+df_text = df_text.limit(50)   # try 10, 50, or 100
+
+
+# -------------------------------------------
+# Step 3: Initialize Databricks embeddings
+# -------------------------------------------
+from databricks_langchain import DatabricksEmbeddings
+
+# Use Databricks-managed embeddings endpoint
+embeddings = DatabricksEmbeddings(endpoint="databricks-bge-large-en")
+
+# -------------------------------------------
+# Step 4: Generate embeddings (serverless-safe)
+# -------------------------------------------
+import pandas as pd
+from pyspark.sql.types import StructType, StructField, StringType, ArrayType, FloatType
+
+schema = StructType([
+    StructField("id", StringType(), True),
+    StructField("content", StringType(), True),
+    StructField("embedding", ArrayType(FloatType()), True)
+])
+
+def embed_iterator(iterator):
+    for pdf in iterator:
+        pdf = pdf.copy()
+        pdf["embedding"] = pdf["content"].apply(lambda text: list(embeddings.embed_query(text)))
+        yield pdf
+
+embedded_df = df_text.mapInPandas(embed_iterator, schema=schema)
+
+embedded_df.show(5, truncate=False)
+
+# -------------------------------------------
+# Step 5: Save embeddings to Delta table
+# -------------------------------------------
+
+embedded_df.write.format("delta") \
+    .mode("overwrite") \
+    .insertInto("demo.vector_demo.nyc_taxi_embeddings")
+
+spark.sql("SELECT * FROM demo.vector_demo.nyc_taxi_embeddings LIMIT 5").show(truncate=False)
+
+# -------------------------------------------
+# Step 6: Create Vector Search index
+# -------------------------------------------
+from databricks.vector_search.client import VectorSearchClient
+
+client = VectorSearchClient()
+
+vs_index = client.create_delta_sync_index(
+    endpoint_name="vs_endpoint",                                # your existing endpoint
+    source_table_name="demo.vector_demo.nyc_taxi_embeddings",  # fully qualified Delta table
+    index_name="demo.vector_demo.nyc_taxi_index",              # fully qualified index name
+    pipeline_type="TRIGGERED",                                  # embeddings already computed
+    primary_key="id",
+    embedding_vector_column="embedding",
+    embedding_dimension=1024                                     # matches BGE large
+)
+
+print("Vector index created:", vs_index.name)
